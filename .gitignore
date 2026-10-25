@@ -1,6 +1,11 @@
 .env
-data/raw/**
+# data/raw/**
+# !data/raw/olist/.gitkeep
+
+#claude suggested changed by ayushman on 28 oct - below 2 lines
+data/raw/olist/*
 !data/raw/olist/.gitkeep
+
 __pycache__/
 *.pyc
 .venv/
