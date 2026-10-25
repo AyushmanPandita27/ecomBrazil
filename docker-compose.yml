@@ -1,0 +1,120 @@
+# Olist Data Platform — local stack (Week 1)
+# Services:
+#   source-db  : Postgres holding the Olist source tables (the "store database")
+#   rustfs     : S3-compatible object storage = our data lake (replaces MinIO, whose images were discontinued)
+#   lake-init  : one-shot job that creates the lake bucket
+#   airflow-db : Postgres for Airflow's own metadata
+#   airflow    : Airflow 3 (standalone: API server + scheduler + dag processor in one container)
+
+services:
+  source-db:
+    image: postgres:16
+    container_name: olist-source-db
+    environment:
+      POSTGRES_USER: ${SOURCE_DB_USER:-olist}
+      POSTGRES_PASSWORD: ${SOURCE_DB_PASSWORD:-olist}
+      POSTGRES_DB: ${SOURCE_DB_NAME:-olist}
+    ports:
+      - "5433:5432"          # host 5433 to avoid clashing with any local Postgres
+    volumes:
+      - source-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SOURCE_DB_USER:-olist} -d ${SOURCE_DB_NAME:-olist}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: olist-lake
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${LAKE_ACCESS_KEY:-lakeadmin}
+      RUSTFS_SECRET_KEY: ${LAKE_SECRET_KEY:-lakeadmin123}
+    ports:
+      - "9000:9000"          # S3 API
+      - "9001:9001"          # web console
+    volumes:
+      - lake-data:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://127.0.0.1:9000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  lake-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${LAKE_ACCESS_KEY:-lakeadmin}
+      AWS_SECRET_ACCESS_KEY: ${LAKE_SECRET_KEY:-lakeadmin123}
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://${LAKE_BUCKET:-olist-lake} 2>/dev/null
+        || echo "bucket already exists";
+        aws --endpoint-url http://rustfs:9000 s3 ls
+    restart: "no"
+
+  airflow-db:
+    image: postgres:16
+    container_name: olist-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow:
+    build: ./airflow
+    container_name: olist-airflow
+    command: standalone
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      source-db:
+        condition: service_healthy
+      lake-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "True"
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"   # local dev only: no login screen
+      PYTHONPATH: /opt/airflow/src
+      # Connection details our own code reads
+      SOURCE_DB_HOST: source-db
+      SOURCE_DB_PORT: "5432"
+      SOURCE_DB_USER: ${SOURCE_DB_USER:-olist}
+      SOURCE_DB_PASSWORD: ${SOURCE_DB_PASSWORD:-olist}
+      SOURCE_DB_NAME: ${SOURCE_DB_NAME:-olist}
+      LAKE_ENDPOINT: http://rustfs:9000
+      LAKE_BUCKET: ${LAKE_BUCKET:-olist-lake}
+      AWS_ACCESS_KEY_ID: ${LAKE_ACCESS_KEY:-lakeadmin}
+      AWS_SECRET_ACCESS_KEY: ${LAKE_SECRET_KEY:-lakeadmin123}
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "8080:8080"          # Airflow UI
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+
+volumes:
+  source-db-data:
+  lake-data:
+  airflow-db-data:
